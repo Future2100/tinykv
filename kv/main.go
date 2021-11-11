@@ -10,6 +10,9 @@ import (
 	"syscall"
 	"time"
 
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/keepalive"
+
 	"github.com/pingcap-incubator/tinykv/kv/config"
 	"github.com/pingcap-incubator/tinykv/kv/server"
 	"github.com/pingcap-incubator/tinykv/kv/storage"
@@ -17,8 +20,6 @@ import (
 	"github.com/pingcap-incubator/tinykv/kv/storage/standalone_storage"
 	"github.com/pingcap-incubator/tinykv/log"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/tinykvpb"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/keepalive"
 )
 
 var (
@@ -26,6 +27,7 @@ var (
 	storeAddr     = flag.String("addr", "", "store address")
 	dbPath        = flag.String("path", "", "directory path of db")
 	logLevel      = flag.String("loglevel", "", "the level of log")
+	raftStorage   = flag.Bool("raft", false, "whether use raft storage")
 )
 
 func main() {
@@ -43,6 +45,7 @@ func main() {
 	if *logLevel != "" {
 		conf.LogLevel = *logLevel
 	}
+	conf.Raft = *raftStorage
 
 	log.SetLevelByString(conf.LogLevel)
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds | log.Lshortfile)
