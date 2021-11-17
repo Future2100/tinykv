@@ -16,6 +16,7 @@ package raft
 
 import (
 	"errors"
+	"math/rand"
 
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
@@ -164,8 +165,36 @@ func newRaft(c *Config) *Raft {
 	if err := c.validate(); err != nil {
 		panic(err.Error())
 	}
-	// Your Code Here (2A).
-	return nil
+
+	storage := c.Storage
+	hs, _, err := storage.InitialState()
+	if err != nil {
+		panic(err.Error())
+	}
+	prs := make(map[uint64]*Progress)
+	if len(c.peers) != 0 {
+		for _, id := range c.peers {
+			prs[id] = &Progress{Next: 1, Match: 0}
+		}
+	}
+
+	return &Raft{
+		id: c.ID,
+
+		Term: hs.Term,
+		Vote: hs.Vote,
+
+		RaftLog: newLog(c.Storage),
+
+		Prs: prs,
+
+		State: StateFollower,
+
+		votes: make(map[uint64]bool),
+
+		heartbeatTimeout: c.HeartbeatTick,
+		electionTimeout:  c.ElectionTick,
+	}
 }
 
 // sendAppend sends an append RPC with new entries (if any) and the
@@ -178,27 +207,119 @@ func (r *Raft) sendAppend(to uint64) bool {
 // sendHeartbeat sends a heartbeat RPC to the given peer.
 func (r *Raft) sendHeartbeat(to uint64) {
 	// Your Code Here (2A).
+	r.msgs = append(r.msgs, pb.Message{
+		From:    r.id,
+		To:      to,
+		Term:    r.Term,
+		MsgType: pb.MessageType_MsgHeartbeat,
+	})
+}
+
+func (r *Raft) sendRequestVoteToPeers() {
+	if r.Lead != None {
+		return
+	}
+
+	for id, _ := range r.Prs {
+		if id == r.id {
+			continue
+		}
+		r.msgs = append(r.msgs, pb.Message{
+			From:    r.id,
+			To:      id,
+			Term:    r.Term,
+			MsgType: pb.MessageType_MsgRequestVote,
+		})
+	}
+}
+
+func (r *Raft) voteMajority() bool {
+	majority := len(r.Prs)/2 + 1
+
+	count := 0
+	for _, vote := range r.votes {
+		if vote {
+			count++
+		}
+	}
+
+	return count >= majority
+}
+
+func (r *Raft) isLeader() bool {
+	return r.State == StateLeader
 }
 
 // tick advances the internal logical clock by a single tick.
 func (r *Raft) tick() {
 	// Your Code Here (2A).
+	r.electionElapsed++
+
+	if r.isLeader() {
+		r.heartbeatElapsed++
+	}
+
+	if r.heartbeatElapsed >= r.heartbeatTimeout {
+		if err := r.Step(pb.Message{MsgType: pb.MessageType_MsgBeat}); err != nil {
+			panic(err.Error())
+		}
+	}
+
+	if r.electionElapsed >= r.electionTimeout {
+		if !r.isLeader() {
+			if err := r.Step(pb.Message{From: r.id, To: r.id, MsgType: pb.MessageType_MsgHup}); err != nil {
+				panic(err.Error())
+			}
+		}
+	}
 }
 
 // becomeFollower transform this peer's state to Follower
 func (r *Raft) becomeFollower(term uint64, lead uint64) {
 	// Your Code Here (2A).
+	r.Term = term
+	r.Lead = lead
+	r.State = StateFollower
+	r.heartbeatElapsed = 0
+	r.resetElectionElapsed()
 }
 
 // becomeCandidate transform this peer's state to candidate
 func (r *Raft) becomeCandidate() {
 	// Your Code Here (2A).
+	r.Term++
+	r.Lead = None
+	r.Vote = r.id
+	r.State = StateCandidate
+	r.resetElectionElapsed()
+
+	r.votes[r.id] = true
+
+	if r.voteMajority() {
+		r.becomeLeader()
+	}
 }
 
 // becomeLeader transform this peer's state to leader
 func (r *Raft) becomeLeader() {
 	// Your Code Here (2A).
 	// NOTE: Leader should propose a noop entry on its term
+	r.State = StateLeader
+	r.Lead = r.id
+	r.heartbeatElapsed = 0
+
+	for id, _ := range r.Prs {
+		if id == r.id {
+			continue
+		}
+
+		r.msgs = append(r.msgs, pb.Message{
+			From:    r.id,
+			To:      id,
+			Term:    r.Term,
+			MsgType: pb.MessageType_MsgAppend,
+		})
+	}
 }
 
 // Step the entrance of handle message, see `MessageType`
@@ -207,20 +328,138 @@ func (r *Raft) Step(m pb.Message) error {
 	// Your Code Here (2A).
 	switch r.State {
 	case StateFollower:
+		switch m.MsgType {
+		case pb.MessageType_MsgAppend:
+			if len(m.Entries) == 0 {
+				r.Term = m.Term
+				r.Lead = m.From
+				r.Vote = None
+				r.handleAppendEntries(pb.Message{
+					MsgType: pb.MessageType_MsgAppendResponse,
+					To:      m.From,
+					From:    r.id,
+					Term:    r.Term,
+				})
+			} else {
+				// TODO: append log
+			}
+
+		case pb.MessageType_MsgHup:
+			r.becomeCandidate()
+			r.sendRequestVoteToPeers()
+		case pb.MessageType_MsgRequestVote:
+			if r.Vote == None {
+				r.Vote = m.From
+				r.Term = m.Term
+			}
+			r.handleAppendEntries(pb.Message{
+				From:    r.id,
+				To:      m.From,
+				Term:    r.Term,
+				Reject:  !(r.Vote == m.From),
+				MsgType: pb.MessageType_MsgRequestVoteResponse,
+			})
+		case pb.MessageType_MsgHeartbeat:
+			r.handleHeartbeat(m)
+		}
 	case StateCandidate:
+		switch m.MsgType {
+		case pb.MessageType_MsgAppend:
+			if r.Term <= m.Term {
+				r.Vote = None
+				r.becomeFollower(m.Term, m.From)
+			}
+			r.handleAppendEntries(pb.Message{
+				From:    r.id,
+				To:      m.From,
+				Term:    r.Term,
+				MsgType: pb.MessageType_MsgAppendResponse,
+			})
+		case pb.MessageType_MsgHup:
+			r.becomeCandidate()
+			r.sendRequestVoteToPeers()
+		case pb.MessageType_MsgRequestVoteResponse:
+			r.votes[m.From] = !m.Reject
+			if r.voteMajority() {
+				r.becomeLeader()
+			}
+		case pb.MessageType_MsgRequestVote:
+			vote := r.Term < m.Term
+			if vote {
+				r.Vote = m.From
+				r.becomeFollower(m.Term, None)
+			}
+
+			r.handleAppendEntries(pb.Message{
+				From:    r.id,
+				To:      m.From,
+				Term:    r.Term,
+				Reject:  !vote,
+				MsgType: pb.MessageType_MsgRequestVoteResponse,
+			})
+		case pb.MessageType_MsgHeartbeat:
+			r.handleHeartbeat(m)
+		}
 	case StateLeader:
+		switch m.MsgType {
+		case pb.MessageType_MsgAppend:
+			if r.Term < m.Term {
+				r.becomeFollower(m.Term, m.From)
+			}
+			r.handleAppendEntries(pb.Message{
+				From:    r.id,
+				To:      m.From,
+				Term:    r.Term,
+				MsgType: pb.MessageType_MsgAppendResponse,
+			})
+		case pb.MessageType_MsgPropose:
+			break
+		case pb.MessageType_MsgBeat:
+			r.heartbeatElapsed = 0
+			for id, _ := range r.Prs {
+				if id != r.id {
+					r.sendHeartbeat(id)
+				}
+			}
+		case pb.MessageType_MsgRequestVote:
+			vote := m.Term > r.Term
+			if vote {
+				r.Vote = m.From
+				r.becomeFollower(m.Term, None)
+			}
+
+			r.handleAppendEntries(pb.Message{
+				From:    r.id,
+				To:      m.From,
+				Reject:  !vote,
+				MsgType: pb.MessageType_MsgRequestVoteResponse,
+			})
+		}
 	}
 	return nil
+}
+
+// resetElectionElapsed will assign a random negative value to electionElapsed to simulate random election timeout
+func (r *Raft) resetElectionElapsed() {
+	r.electionElapsed = -rand.Int() % r.electionTimeout
 }
 
 // handleAppendEntries handle AppendEntries RPC request
 func (r *Raft) handleAppendEntries(m pb.Message) {
 	// Your Code Here (2A).
+	r.msgs = append(r.msgs, m)
 }
 
 // handleHeartbeat handle Heartbeat RPC request
 func (r *Raft) handleHeartbeat(m pb.Message) {
 	// Your Code Here (2A).
+	r.Vote = None
+	r.becomeFollower(m.Term, m.From)
+	r.handleAppendEntries(pb.Message{
+		From:    r.id,
+		To:      m.From,
+		MsgType: pb.MessageType_MsgHeartbeatResponse,
+	})
 }
 
 // handleSnapshot handle Snapshot RPC request
