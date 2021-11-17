@@ -502,7 +502,8 @@ func TestLeaderCommitPrecedingEntries2AB(t *testing.T) {
 
 		li := uint64(len(tt))
 		wents := append(tt, pb.Entry{Term: 3, Index: li + 1}, pb.Entry{Term: 3, Index: li + 2, Data: []byte("some data")})
-		if g := r.RaftLog.nextEnts(); !reflect.DeepEqual(g, wents) {
+		g := r.RaftLog.nextEnts()
+		if !reflect.DeepEqual(g, wents) {
 			t.Errorf("#%d: ents = %+v, want %+v", i, g, wents)
 		}
 	}
